@@ -1,56 +1,33 @@
-"""AI Short-Selling & Undervalued Stock Screener
-
-Run with:
-    streamlit run ai_short_selling_screener.py
-
-This application is for educational and research purposes only. It is not
-investment, legal, or tax advice, and it does not place trades.
 """
-
-from __future__ import annotations
-
-import io
-from typing import Any
+AI Short-Selling & Undervalued Stock Screener with Backtesting Engine
+"""
 
 import numpy as np
 import pandas as pd
 import streamlit as st
 import yfinance as yf
 
-
 st.set_page_config(
-    page_title="AI Short-Selling & Undervalued Stock Screener",
+    page_title="AI Short Screener & Backtester",
     page_icon="📉",
     layout="wide",
     initial_sidebar_state="expanded",
 )
 
-
-MARKET_UNIVERSES: dict[str, list[str]] = {
+MARKET_UNIVERSES = {
     "US Tech - S&P 500 / NASDAQ": [
-        "AAPL", "MSFT", "NVDA", "AMZN", "META", "GOOGL", "GOOG", "AVGO",
-        "TSLA", "AMD", "NFLX", "ADBE", "CRM", "ORCL", "CSCO", "QCOM",
-        "INTC", "INTU", "AMAT", "MU", "ADI", "TXN", "PANW", "SNPS",
-        "CDNS", "NOW", "SHOP", "PLTR", "CRWD", "MELI",
+        "AAPL", "MSFT", "NVDA", "AMZN", "META", "GOOGL", "TSLA", "AMD", "NFLX", "PLTR",
     ],
     "Hong Kong - Hang Seng Index": [
-        "0700.HK", "9988.HK", "3690.HK", "9618.HK", "1810.HK", "0005.HK",
-        "1299.HK", "0941.HK", "0388.HK", "2318.HK", "0883.HK", "1398.HK",
-        "3988.HK", "2628.HK", "2388.HK", "0001.HK", "0011.HK", "0002.HK",
-        "0066.HK", "1928.HK", "2018.HK", "1038.HK", "0267.HK", "1113.HK",
+        "0700.HK", "9988.HK", "3690.HK", "9618.HK", "1810.HK", "0005.HK", "1299.HK", "0941.HK",
     ],
     "Global Major Stocks": [
-        "AAPL", "MSFT", "0700.HK", "9988.HK", "005930.KS", "7203.T",
-        "6758.T", "601398.SS", "NESN.SW", "ASML", "SAP", "SHEL", "TTE",
-        "NVO", "ROG.SW", "MC.PA", "OR.PA", "BHP", "RIO", "RELIANCE.NS",
-        "INFY", "SONY", "TM", "UL", "AZN", "HSBA.L", "SHOP", "TSM",
+        "AAPL", "MSFT", "0700.HK", "9988.HK", "ASML", "SAP", "SHEL", "TSM",
     ],
 }
 
-
 @st.cache_data(ttl=900, show_spinner=False)
-def download_prices(tickers: tuple[str, ...], period: str = "1y") -> dict[str, pd.DataFrame]:
-    """Download daily OHLCV data in one Yahoo Finance request."""
+def download_prices(tickers: tuple[str, ...], period: str = "2y") -> dict[str, pd.DataFrame]:
     raw = yf.download(
         list(tickers),
         period=period,
@@ -60,12 +37,10 @@ def download_prices(tickers: tuple[str, ...], period: str = "1y") -> dict[str, p
         threads=True,
         progress=False,
     )
-    result: dict[str, pd.DataFrame] = {}
+    result = {}
     if raw is None or raw.empty:
         return result
 
-    # yfinance returns a two-level column index for multiple tickers and a
-    # one-level index for a single ticker.
     if isinstance(raw.columns, pd.MultiIndex):
         first_level = set(raw.columns.get_level_values(0))
         for ticker in tickers:
@@ -80,9 +55,7 @@ def download_prices(tickers: tuple[str, ...], period: str = "1y") -> dict[str, p
         result[tickers[0]] = raw.copy().dropna(how="all")
     return result
 
-
-def calculate_rsi(close: pd.Series, period: int) -> float:
-    """Calculate Wilder-style RSI from closing prices."""
+def calculate_rsi_series(close: pd.Series, period: int = 14) -> pd.Series:
     delta = close.diff()
     gains = delta.clip(lower=0)
     losses = -delta.clip(upper=0)
@@ -90,188 +63,204 @@ def calculate_rsi(close: pd.Series, period: int) -> float:
     avg_loss = losses.ewm(alpha=1 / period, min_periods=period, adjust=False).mean()
     rs = avg_gain / avg_loss.replace(0, np.nan)
     rsi = 100 - (100 / (1 + rs))
-    # A continuously rising series has RSI=100 rather than missing RSI.
-    rsi = rsi.where(avg_loss != 0, 100.0)
-    return float(rsi.dropna().iloc[-1]) if not rsi.dropna().empty else float("nan")
+    return rsi.where(avg_loss != 0, 100.0)
 
-
-def safe_number(value: Any) -> float:
-    try:
-        number = float(value)
-        return number if np.isfinite(number) else float("nan")
-    except (TypeError, ValueError):
-        return float("nan")
-
-
-def get_company_name_and_market_cap(ticker: str) -> tuple[str, float]:
-    """Read company metadata, tolerating Yahoo Finance field differences."""
-    instrument = yf.Ticker(ticker)
-    name = ticker
-    market_cap = float("nan")
-    try:
-        info = instrument.info
-        name = info.get("longName") or info.get("shortName") or ticker
-        market_cap = safe_number(info.get("marketCap")) / 1_000_000_000
-    except Exception:
-        # Metadata failures should not prevent the remaining symbols from
-        # being analyzed; the price-based calculations are still useful.
-        pass
-    return str(name), market_cap
-
-
-def analyze_market(
-    tickers: list[str], rsi_period: int, min_market_cap: float, ma_offset: float,
-    overbought: float,
-) -> tuple[pd.DataFrame, list[str]]:
-    """Calculate indicators and return only symbols matching the scan rules."""
-    price_data = download_prices(tuple(tickers))
-    rows: list[dict[str, Any]] = []
-    errors: list[str] = []
+def analyze_market(tickers: list[str], rsi_period: int, ma_offset: float, overbought: float):
+    price_data = download_prices(tuple(tickers), period="1y")
+    rows = []
+    errors = []
 
     for ticker in tickers:
         frame = price_data.get(ticker)
-        if frame is None or frame.empty or "Close" not in frame or "Volume" not in frame:
-            errors.append(f"{ticker}: no usable historical price data")
+        if frame is None or frame.empty or "Close" not in frame:
+            errors.append(f"{ticker}: no data")
             continue
 
         close = pd.to_numeric(frame["Close"], errors="coerce").dropna()
-        volume = pd.to_numeric(frame["Volume"], errors="coerce").reindex(close.index).fillna(0)
         if len(close) < max(rsi_period + 1, 20):
             errors.append(f"{ticker}: insufficient history")
             continue
 
-        # Use a 20-day SMA as the stable, widely available VWAP alternative.
         moving_average = float(close.rolling(20).mean().iloc[-1])
         current_price = float(close.iloc[-1])
-        rsi_value = calculate_rsi(close, rsi_period)
-        name, market_cap = get_company_name_and_market_cap(ticker)
+        rsi_series = calculate_rsi_series(close, rsi_period)
+        rsi_value = float(rsi_series.dropna().iloc[-1])
         price_threshold = moving_average * (1 + ma_offset / 100)
 
-        # A short-selling watch signal is generated when momentum is
-        # overbought and price is above its moving-average threshold.
-        matches = (
-            np.isfinite(rsi_value)
-            and np.isfinite(market_cap)
-            and market_cap >= min_market_cap
-            and rsi_value > overbought
-            and current_price > price_threshold
-        )
-        if matches:
-            rows.append(
-                {
+        if rsi_value > overbought and current_price > price_threshold:
+            rows.append({
+                "Ticker": ticker,
+                "Current Price": current_price,
+                "RSI Value": rsi_value,
+                "20-SMA": moving_average,
+                "Signal Generated": "SHORT-SELL WATCH",
+            })
+
+    return pd.DataFrame(rows), errors
+
+def run_backtest_simulation(
+    ticker: str,
+    rsi_period: int,
+    overbought: float,
+    ma_offset: float,
+    take_profit_pct: float,
+    stop_loss_pct: float,
+    max_hold_days: int,
+    initial_capital: float,
+):
+    df_raw = yf.download(ticker, period="2y", interval="1d", progress=False)
+    if df_raw.empty or "Close" not in df_raw:
+        return pd.DataFrame(), {}
+
+    close = pd.to_numeric(df_raw["Close"].squeeze(), errors="coerce").dropna()
+    rsi = calculate_rsi_series(close, rsi_period)
+    sma = close.rolling(20).mean()
+
+    df = pd.DataFrame({"Close": close, "RSI": rsi, "SMA": sma}).dropna()
+
+    trades = []
+    in_position = False
+    entry_price = 0.0
+    entry_date = None
+    days_held = 0
+
+    capital = initial_capital
+    portfolio_history = []
+
+    for i in range(len(df)):
+        date = df.index[i]
+        curr_price = float(df["Close"].iloc[i])
+        curr_rsi = float(df["RSI"].iloc[i])
+        curr_sma = float(df["SMA"].iloc[i])
+
+        # Evaluate Exit logic if currently in a short trade
+        if in_position:
+            days_held += 1
+            price_change_pct = (curr_price - entry_price) / entry_price  # Short loses if price rises
+            exit_reason = None
+            pnl_pct = 0.0
+
+            if price_change_pct <= -take_profit_pct / 100:
+                exit_reason = "Take Profit Target Hit"
+                pnl_pct = take_profit_pct / 100
+            elif price_change_pct >= stop_loss_pct / 100:
+                exit_reason = "Stop Loss Hit"
+                pnl_pct = -stop_loss_pct / 100
+            elif days_held >= max_hold_days:
+                exit_reason = "Max Hold Time Reached"
+                pnl_pct = -price_change_pct
+
+            if exit_reason:
+                pnl_dollar = capital * pnl_pct
+                capital += pnl_dollar
+                trades.append({
                     "Ticker": ticker,
-                    "Company Name": name,
-                    "Current Price": current_price,
-                    "RSI Value": rsi_value,
-                    "Market Cap ($B)": market_cap,
-                    "Signal Generated": "SHORT-SELL WATCH",
-                }
-            )
+                    "Entry Date": entry_date.strftime("%Y-%m-%d"),
+                    "Exit Date": date.strftime("%Y-%m-%d"),
+                    "Entry Price ($)": round(entry_price, 2),
+                    "Exit Price ($)": round(curr_price, 2),
+                    "Days Held": days_held,
+                    "Result": "WIN" if pnl_pct > 0 else "LOSS",
+                    "P&L (%)": round(pnl_pct * 100, 2),
+                    "P&L ($)": round(pnl_dollar, 2),
+                    "Exit Reason": exit_reason,
+                })
+                in_position = False
+                days_held = 0
 
-    columns = [
-        "Ticker", "Company Name", "Current Price", "RSI Value",
-        "Market Cap ($B)", "Signal Generated",
-    ]
-    return pd.DataFrame(rows, columns=columns), errors
+        # Evaluate Entry logic if not in a trade
+        elif not in_position:
+            price_threshold = curr_sma * (1 + ma_offset / 100)
+            if curr_rsi > overbought and curr_price > price_threshold:
+                in_position = True
+                entry_price = curr_price
+                entry_date = date
+                days_held = 0
 
+        portfolio_history.append({"Date": date, "Portfolio Value": capital})
 
-def format_results(frame: pd.DataFrame) -> pd.DataFrame:
-    formatted = frame.copy()
-    if not formatted.empty:
-        formatted["Current Price"] = formatted["Current Price"].map(lambda x: f"{x:,.2f}")
-        formatted["RSI Value"] = formatted["RSI Value"].map(lambda x: f"{x:.2f}")
-        formatted["Market Cap ($B)"] = formatted["Market Cap ($B)"].map(lambda x: f"${x:,.2f}")
-    return formatted
+    trades_df = pd.DataFrame(trades)
+    perf_df = pd.DataFrame(portfolio_history).set_index("Date")
 
+    summary = {
+        "Starting Capital": initial_capital,
+        "Ending Capital": round(capital, 2),
+        "Total Return ($)": round(capital - initial_capital, 2),
+        "Total Return (%)": round(((capital - initial_capital) / initial_capital) * 100, 2),
+        "Total Trades": len(trades),
+        "Win Rate (%)": round((len(trades_df[trades_df["Result"] == "WIN"]) / len(trades_df) * 100), 2) if not trades_df.empty else 0.0,
+    }
 
-st.title("AI Short-Selling & Undervalued Stock Screener")
-st.caption(
-    "A quantitative research dashboard that flags potentially overbought stocks "
-    "for further short-selling research. Data provided by Yahoo Finance."
-)
+    return trades_df, perf_df, summary
+
+# --- UI LAYOUT ---
+st.title("AI Short-Selling Screener & Backtester")
+
+tab1, tab2 = st.tabs(["🔍 Live Market Screener", "📊 Historical Backtest Engine"])
 
 with st.sidebar:
-    st.header("Control Panel")
-    selected_market = st.selectbox("Target Market Index", list(MARKET_UNIVERSES))
+    st.header("Strategy Rules")
+    selected_market = st.selectbox("Market Index", list(MARKET_UNIVERSES))
+    overbought = st.slider("RSI Overbought Target", 50, 90, 70)
+    rsi_period = st.number_input("RSI Period", 2, 50, 14)
+    ma_offset = st.number_input("SMA Offset (%)", 0.0, 20.0, 2.0, step=0.5)
+
     st.divider()
-    overbought = st.slider("RSI Overbought Level", min_value=50, max_value=90, value=70)
-    rsi_period = st.number_input("RSI Period Length", min_value=2, max_value=100, value=14, step=1)
-    min_market_cap = st.number_input(
-        "Minimum Market Cap ($B)", min_value=0.0, max_value=10_000.0, value=1.0, step=0.5,
-    )
-    ma_offset = st.number_input(
-        "Price vs Moving Average Offset (%)", min_value=0.0, max_value=100.0, value=2.0, step=0.5,
-    )
-    st.divider()
-    st.info(
-        "Rule: RSI > selected overbought level, price > 20-day SMA plus the selected offset, "
-        "and market cap ≥ the selected minimum."
-    )
-    run_scan = st.button("🔍 RUN MARKET SCAN", type="primary", use_container_width=True)
+    st.header("Simulation Settings")
+    take_profit = st.number_input("Take Profit Target (%)", 1.0, 50.0, 5.0, step=0.5)
+    stop_loss = st.number_input("Stop Loss Limit (%)", 1.0, 50.0, 3.0, step=0.5)
+    max_days = st.number_input("Max Position Hold (Days)", 1, 60, 10)
+    initial_cap = st.number_input("Initial Portfolio ($)", 1000, 1000000, 10000, step=1000)
 
-if "results" not in st.session_state:
-    st.session_state.results = pd.DataFrame()
-    st.session_state.scanned = 0
-    st.session_state.errors = []
-    st.session_state.scan_market = ""
+with tab1:
+    st.subheader("Market Scan Controls")
+    if st.button("🔍 RUN MARKET SCAN", type="primary"):
+        universe = MARKET_UNIVERSES[selected_market]
+        with st.spinner("Analyzing universe..."):
+            res, errs = analyze_market(universe, int(rsi_period), float(ma_offset), float(overbought))
+            st.session_state["scan_results"] = res
 
-if run_scan:
-    universe = MARKET_UNIVERSES[selected_market]
-    with st.spinner(f"Scanning {len(universe)} symbols in {selected_market}..."):
-        results, errors = analyze_market(
-            universe, int(rsi_period), float(min_market_cap), float(ma_offset), int(overbought)
-        )
-    st.session_state.results = results
-    st.session_state.scanned = len(universe)
-    st.session_state.errors = errors
-    st.session_state.scan_market = selected_market
-
-results = st.session_state.results
-if st.session_state.scanned == 0:
-    st.info("Choose your scan parameters in the sidebar and click **RUN MARKET SCAN** to begin.")
-else:
-    average_rsi = float(results["RSI Value"].mean()) if not results.empty else 0.0
-    c1, c2, c3 = st.columns(3)
-    c1.metric("Total Stocks Scanned", st.session_state.scanned)
-    c2.metric("Matches Found", len(results))
-    c3.metric("Average RSI of Matches", f"{average_rsi:.2f}" if not results.empty else "—")
-
-    st.subheader(f"Flagged Stocks — {st.session_state.scan_market}")
-    if results.empty:
-        st.success("No stocks matched all selected criteria.")
+    if "scan_results" in st.session_state and not st.session_state["scan_results"].empty:
+        st.dataframe(st.session_state["scan_results"], use_container_width=True)
     else:
-        st.dataframe(
-            format_results(results),
-            use_container_width=True,
-            hide_index=True,
-            column_config={
-                "Current Price": st.column_config.TextColumn("Current Price"),
-                "RSI Value": st.column_config.TextColumn("RSI Value"),
-                "Market Cap ($B)": st.column_config.TextColumn("Market Cap ($B)"),
-            },
-        )
-        csv_data = results.to_csv(index=False).encode("utf-8")
-        st.download_button(
-            "⬇️ Download Flagged Stocks (CSV)",
-            data=csv_data,
-            file_name="flagged_stocks.csv",
-            mime="text/csv",
-        )
+        st.info("Run a market scan to locate active candidates.")
 
-    if st.session_state.errors:
-        with st.expander(f"Data warnings ({len(st.session_state.errors)})"):
-            st.write("Some symbols could not be fully analyzed; they were skipped.")
-            st.code("\n".join(st.session_state.errors))
+with tab2:
+    st.subheader("Simulate Short-Selling Strategy")
+    
+    # Allow choosing from flagged scan results or manual ticker input
+    default_tickers = ["TSLA", "NVDA", "AAPL", "0700.HK", "9988.HK"]
+    if "scan_results" in st.session_state and not st.session_state["scan_results"].empty:
+        ticker_options = list(st.session_state["scan_results"]["Ticker"].unique())
+    else:
+        ticker_options = default_tickers
 
-st.divider()
-st.caption(
-    "Disclaimer: This tool is for educational purposes only. Yahoo Finance data may be delayed, "
-    "incomplete, or inaccurate. A signal is not a recommendation to sell short or trade any security."
-)
+    selected_ticker = st.selectbox("Select Stock to Backtest (Past 2 Years Data)", ticker_options)
 
-# Keep io imported intentionally for compatibility with environments that
-# monkey-patch Streamlit download handling; no file-system state is required.
-_UNUSED = io
+    if st.button("🚀 RUN HISTORICAL BACKTEST"):
+        with st.spinner(f"Simulating trade performance for {selected_ticker}..."):
+            trades_df, perf_df, summary = run_backtest_simulation(
+                ticker=selected_ticker,
+                rsi_period=int(rsi_period),
+                overbought=float(overbought),
+                ma_offset=float(ma_offset),
+                take_profit_pct=float(take_profit),
+                stop_loss_pct=float(stop_loss),
+                max_hold_days=int(max_days),
+                initial_capital=float(initial_cap),
+            )
 
-if __name__ == "__main__":
-    pass
+            if trades_df.empty:
+                st.warning("No trade signals were triggered historically for this ticker with these exact parameters.")
+            else:
+                c1, c2, c3, c4 = st.columns(4)
+                c1.metric("Total Trades", summary["Total Trades"])
+                c2.metric("Win Rate", f"{summary['Win Rate (%)']}%")
+                c3.metric("Net P&L ($)", f"${summary['Total Return ($)']}")
+                c4.metric("Return on Capital", f"{summary['Total Return (%)']}%")
+
+                st.subheader("Portfolio Growth Curve ($)")
+                st.line_chart(perf_df["Portfolio Value"])
+
+                st.subheader("Trade Log Details")
+                st.dataframe(trades_df, use_container_width=True)
